@@ -1,0 +1,266 @@
+// OBS Sketch 1.3.0 | GPL-2.0-or-later
+uniform float4x4 ViewProj;
+uniform texture2d image;
+uniform float texture_width;
+uniform float texture_height;
+uniform float amount;
+uniform float line_width;
+uniform float edge_threshold;
+uniform float ink;
+uniform float levels;
+uniform float smoothing;
+uniform float saturation;
+uniform float paper;
+uniform float hatching;
+uniform float hatch_spacing;
+uniform float roughness;
+uniform float highlights;
+uniform float silhouette;
+uniform float style;
+uniform float paint_shadows;
+uniform float fine_lines;
+uniform float hatch_length;
+uniform float black_fill;
+uniform float hatch_density;
+uniform float color_reveal;
+uniform float4 motion_matrix;
+uniform float2 motion_offset;
+uniform float2 tracking_size;
+
+sampler_state source_sampler {
+    Filter = Linear;
+    AddressU = Clamp;
+    AddressV = Clamp;
+};
+
+struct VertData {
+    float4 pos : POSITION;
+    float2 uv : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v)
+{
+    v.pos = mul(float4(v.pos.xyz, 1.0), ViewProj);
+    return v;
+}
+
+float luminance(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
+
+float2 attached_pixel(float2 uv)
+{
+    float2 p = uv * float2(texture_width, texture_height);
+    return float2(dot(motion_matrix.xy,p),dot(motion_matrix.zw,p)) + motion_offset;
+}
+
+// Small analysis image only. The final output always uses the current source.
+float4 PSTrack(VertData v) : TARGET
+{
+    float2 d = 0.25 / tracking_size;
+    float4 p = (image.Sample(source_sampler,v.uv+d)
+              + image.Sample(source_sampler,v.uv-d)
+              + image.Sample(source_sampler,v.uv+d*float2(-1.0,1.0))
+              + image.Sample(source_sampler,v.uv+d*float2(1.0,-1.0))) * 0.25;
+    float l = luminance(p.rgb / max(p.a,0.00001));
+    return float4(l,l,l,p.a);
+}
+
+// Ignore hidden RGB and use center colour for transparent neighbours.
+// Alpha influences silhouette detection separately; never colour gradients.
+float3 neighbor_color(float4 p, float3 center)
+{
+    return p.a > 0.00001 ? p.rgb / max(p.a, 0.00001) : center;
+}
+
+float hatch_line(float coordinate, float spacing)
+{
+    float d = abs(frac(coordinate / spacing) - 0.5) * spacing;
+    return 1.0 - smoothstep(0.35, 1.25, d);
+}
+
+// Small low-pass before extracting ink: wood grain and camera noise should not
+// get the same weight as joints, seams and the silhouette. All taps respect alpha.
+float3 marker_sample(float2 uv, float3 center)
+{
+    float2 s = float2(1.0 / texture_width, 1.0 / texture_height);
+    s *= 1.2 + smoothing * 1.8;
+    float3 c = neighbor_color(image.Sample(source_sampler, uv), center) * 0.140625;
+    c += neighbor_color(image.Sample(source_sampler, uv + float2(s.x, 0.0)), center) * 0.1171875;
+    c += neighbor_color(image.Sample(source_sampler, uv - float2(s.x, 0.0)), center) * 0.1171875;
+    c += neighbor_color(image.Sample(source_sampler, uv + float2(0.0, s.y)), center) * 0.1171875;
+    c += neighbor_color(image.Sample(source_sampler, uv - float2(0.0, s.y)), center) * 0.1171875;
+    c += neighbor_color(image.Sample(source_sampler, uv + s), center) * 0.09765625;
+    c += neighbor_color(image.Sample(source_sampler, uv - s), center) * 0.09765625;
+    c += neighbor_color(image.Sample(source_sampler, uv + s*float2(-1.0,1.0)), center) * 0.09765625;
+    c += neighbor_color(image.Sample(source_sampler, uv + s*float2(1.0,-1.0)), center) * 0.09765625;
+    return c;
+}
+
+// Tapered, finite strokes in staggered groups, instead of a continuous grid.
+// Coordinates are carried by the estimated camera transform between frames.
+float marker_hatch(float2 pixel, float spacing, float length, float cross)
+{
+    float u = pixel.x * 0.8192 + pixel.y * 0.5736;
+    float t = pixel.x * -0.5736 + pixel.y * 0.8192;
+    if (cross > 0.5) { u = pixel.x * 0.7071 - pixel.y * 0.7071; t = (pixel.x + pixel.y) * 0.7071; }
+    float band = floor(u / (spacing * 6.0));
+    float stagger = sin(band * 4.17) * length * 0.8;
+    float row = floor((t + stagger) / (length * 2.4));
+    float phase = frac((t + stagger) / (length * 2.4));
+    float index = floor(u / spacing);
+    float variation = 0.5 + 0.5 * sin(index * 2.31 + row * 7.13);
+    float start = 0.08 + variation * 0.10;
+    float stop = 0.49 + variation * 0.12;
+    float ends = smoothstep(start, start + 0.10, phase) * (1.0 - smoothstep(stop - 0.12, stop, phase));
+    float bend = roughness * (0.8 * sin(t * 0.075 + index * 1.7) + 0.3 * sin(t * 0.23));
+    float dist = abs(frac((u + bend) / spacing) - 0.5) * spacing;
+    float width = (0.35 + 0.55 * variation) * ends;
+    float stroke = (1.0 - smoothstep(width, width + 0.7, dist)) * ends;
+    float group = 0.5 + 0.5 * sin(band * 2.7 + row * 4.1);
+    return stroke * smoothstep(1.0-hatch_density, 1.15-hatch_density, group);
+}
+
+float4 PSMarker(VertData v, float4 src, float3 original)
+{
+    float2 pixel = attached_pixel(v.uv);
+    float wobble = sin(pixel.y * 0.083 + sin(pixel.x * 0.041) * 2.0);
+    float radius = line_width * (1.0 + roughness * 0.18 * wobble);
+    float2 d = float2(radius / texture_width, radius / texture_height);
+    float3 c = marker_sample(v.uv, original);
+    float3 c0 = marker_sample(v.uv + d * float2(-1.0, -1.0), original);
+    float3 c1 = marker_sample(v.uv + d * float2( 0.0, -1.0), original);
+    float3 c2 = marker_sample(v.uv + d * float2( 1.0, -1.0), original);
+    float3 c3 = marker_sample(v.uv + d * float2(-1.0,  0.0), original);
+    float3 c5 = marker_sample(v.uv + d * float2( 1.0,  0.0), original);
+    float3 c6 = marker_sample(v.uv + d * float2(-1.0,  1.0), original);
+    float3 c7 = marker_sample(v.uv + d * float2( 0.0,  1.0), original);
+    float3 c8 = marker_sample(v.uv + d * float2( 1.0,  1.0), original);
+    float3 gx = (-c0 - 2.0*c3 - c6 + c2 + 2.0*c5 + c8) * 0.25;
+    float3 gy = (-c0 - 2.0*c1 - c2 + c6 + 2.0*c7 + c8) * 0.25;
+    float lum = luminance(c);
+    float neighborhood = luminance((c0+c1+c2+c3+c5+c6+c7+c8) * 0.125);
+    // Relative contrast recovers seams on dark materials without turning their
+    // whole surface black. Soft gradients remain paint, not outlines.
+    float gradient = sqrt(dot(gx,gx) + dot(gy,gy)) * 0.57735 / max(0.22, neighborhood);
+    float edge = smoothstep(edge_threshold, edge_threshold + 0.14, gradient);
+    float4 a1 = image.Sample(source_sampler, v.uv + float2(d.x, 0.0));
+    float4 a2 = image.Sample(source_sampler, v.uv - float2(d.x, 0.0));
+    float4 a3 = image.Sample(source_sampler, v.uv + float2(0.0, d.y));
+    float4 a4 = image.Sample(source_sampler, v.uv - float2(0.0, d.y));
+    float min_alpha = min(min(a1.a,a2.a),min(a3.a,a4.a));
+    edge = max(edge, smoothstep(0.04,0.4,max(src.a-min_alpha,0.0))*silhouette);
+
+    float wide = luminance(marker_sample(v.uv + d*float2(3.0,0.0),original)
+                         + marker_sample(v.uv - d*float2(3.0,0.0),original)
+                         + marker_sample(v.uv + d*float2(0.0,3.0),original)
+                         + marker_sample(v.uv - d*float2(0.0,3.0),original)) * 0.25;
+    float crease = smoothstep(0.08,0.22,(neighborhood-lum)/max(neighborhood,0.22));
+    float fine = crease * fine_lines;
+    float shade = 1.0 - smoothstep(0.12,0.72,wide);
+    float count = max(floor(levels+0.5),2.0)-1.0;
+    // Smooth transitions between bands avoid sudden shadow jumps under motion.
+    float shade_level = shade*count;
+    float stepped_shade = (floor(shade_level)+smoothstep(0.35,0.65,frac(shade_level)))/count;
+    // White paint replaces material colour, with separately limited grey shadows.
+    float paint = 0.985 - paint_shadows * lerp(shade,stepped_shade,0.65);
+    float white_base = lerp(lum,paint,paper);
+    float3 base = float3(white_base,white_base,white_base);
+    float hatch1 = marker_hatch(pixel,max(hatch_spacing,4.0),hatch_length,0.0);
+    float hatch2 = marker_hatch(pixel,max(hatch_spacing,4.0)*1.27,hatch_length*0.72,1.0);
+    float shadow_mask = smoothstep(0.12,0.50,shade);
+    float near_crease = smoothstep(0.025,0.12,wide-lum);
+    float strokes = max(hatch1*max(shadow_mask,near_crease),hatch2*smoothstep(0.70,0.95,shade)*0.65)*hatching;
+    float black = (1.0-smoothstep(0.025,0.085,lum))*black_fill;
+    float light_rim = smoothstep(0.025,0.12,lum-wide)*highlights;
+    base = lerp(base,float3(1.0,1.0,1.0),light_rim);
+    base = lerp(base,original,color_reveal);
+    float darkness = saturate(max(max(edge,fine),max(strokes,black))*ink);
+    float3 painted = lerp(base,float3(0.012,0.012,0.012),darkness);
+    return float4(saturate(lerp(original,painted,amount))*src.a,src.a);
+}
+
+float4 PSSketch(VertData v) : TARGET
+{
+    float4 src = image.Sample(source_sampler, v.uv);
+    if (src.a <= 0.00001) return float4(0.0, 0.0, 0.0, src.a);
+    float3 original = src.rgb / src.a;
+    if (style > 2.5) return PSMarker(v, src, original);
+    float2 pixel = attached_pixel(v.uv);
+    // Camera-attached variation, with no time-driven noise.
+    float wobble = sin(pixel.y * 0.093 + sin(pixel.x * 0.047) * 2.0);
+    float radius = line_width * (1.0 + roughness * 0.28 * wobble);
+    float2 d = float2(radius / texture_width, radius / texture_height);
+    float4 p0 = image.Sample(source_sampler, v.uv + d * float2(-1.0, -1.0));
+    float4 p1 = image.Sample(source_sampler, v.uv + d * float2( 0.0, -1.0));
+    float4 p2 = image.Sample(source_sampler, v.uv + d * float2( 1.0, -1.0));
+    float4 p3 = image.Sample(source_sampler, v.uv + d * float2(-1.0,  0.0));
+    float4 p5 = image.Sample(source_sampler, v.uv + d * float2( 1.0,  0.0));
+    float4 p6 = image.Sample(source_sampler, v.uv + d * float2(-1.0,  1.0));
+    float4 p7 = image.Sample(source_sampler, v.uv + d * float2( 0.0,  1.0));
+    float4 p8 = image.Sample(source_sampler, v.uv + d * float2( 1.0,  1.0));
+    float3 c0 = neighbor_color(p0, original);
+    float3 c1 = neighbor_color(p1, original);
+    float3 c2 = neighbor_color(p2, original);
+    float3 c3 = neighbor_color(p3, original);
+    float3 c5 = neighbor_color(p5, original);
+    float3 c6 = neighbor_color(p6, original);
+    float3 c7 = neighbor_color(p7, original);
+    float3 c8 = neighbor_color(p8, original);
+    float3 gx = (-c0 - 2.0*c3 - c6 + c2 + 2.0*c5 + c8) * 0.25;
+    float3 gy = (-c0 - 2.0*c1 - c2 + c6 + 2.0*c7 + c8) * 0.25;
+    float gradient = sqrt(dot(gx, gx) + dot(gy, gy)) * 0.57735;
+    float edge = smoothstep(edge_threshold, edge_threshold + 0.10, gradient);
+    float min_alpha = min(min(p1.a, p3.a), min(p5.a, p7.a));
+    float outline = smoothstep(0.04, 0.4, max(src.a - min_alpha, 0.0)) * silhouette;
+    edge = max(edge, outline);
+    // Alpha-weighted blur, mixed only in low-gradient regions.
+    float weight = src.a * 4.0 + p1.a + p3.a + p5.a + p7.a;
+    float3 blurred = (src.rgb * 4.0 + p1.rgb + p3.rgb + p5.rgb + p7.rgb) / max(weight, 0.00001);
+    float3 base = lerp(original, blurred, smoothing * (1.0 - edge));
+    float lum = luminance(base);
+    if (style > 1.5) lum = luminance(original);
+    base = saturate(lerp(float3(lum, lum, lum), base, saturation));
+    if (style > 0.5 && style < 1.5) base = float3(lum, lum, lum);
+    float count = max(floor(levels + 0.5), 2.0) - 1.0;
+    float3 flat = floor(saturate(base) * count + 0.5) / count;
+    if (style < 0.5) {
+        // Quantise light while preserving the material's hue; per-channel
+        // rounding turned subtle browns into unrelated red/yellow patches.
+        float tone = max(0.08, floor(saturate(lum)*count+0.5)/count);
+        flat = saturate(base * tone / max(lum,0.00001));
+    }
+    // White paint belongs exclusively to PSMarker. In particular, imported
+    // paper=1 settings must never wash out the other three finishes.
+    if (style > 1.5) flat = original;
+    float warp = roughness * 2.0 * sin(pixel.x * 0.033 + pixel.y * 0.017);
+    float hatch1 = hatch_line((pixel.x + pixel.y) * 0.7071 + warp, hatch_spacing);
+    float hatch2 = hatch_line((pixel.x - pixel.y) * 0.7071 + warp, hatch_spacing * 1.23);
+    float shade1 = 1.0 - smoothstep(0.2, 0.62, lum);
+    float shade2 = 1.0 - smoothstep(0.08, 0.28, lum);
+    float strokes = max(hatch1 * shade1, hatch2 * shade2) * hatching;
+    float light_edge = smoothstep(0.02, 0.15, luminance(gx - gy)) * (1.0 - edge);
+    if (style < 1.5) {
+        flat = lerp(flat, float3(1.0, 1.0, 1.0), light_edge * highlights);
+        flat = lerp(flat, original, color_reveal);
+    }
+    float darkness = saturate(max(edge * ink, strokes * ink));
+    float3 ink_color = float3(0.018, 0.021, 0.028);
+    if (style > 0.5 && style < 1.5) ink_color = float3(0.024, 0.024, 0.024);
+    float3 painted = lerp(flat, ink_color, darkness);
+    float3 result = saturate(lerp(original, painted, amount));
+    // Sole output alpha: the unmodified center sample, including partial alpha.
+    return float4(result * src.a, src.a);
+}
+
+technique Draw {
+    pass {
+        vertex_shader = VSDefault(v);
+        pixel_shader = PSSketch(v);
+    }
+}
+
+technique Track {
+    pass {
+        vertex_shader = VSDefault(v);
+        pixel_shader = PSTrack(v);
+    }
+}

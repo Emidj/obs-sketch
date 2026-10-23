@@ -1,0 +1,9 @@
+/build/
+/build-tools/
+/dist/
+/FOTOS/
+/tests/artifacts/
+__pycache__/
+*.pdb
+*.dmp
+.env
